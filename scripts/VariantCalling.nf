@@ -1,10 +1,11 @@
 params.RawReads = "/home/linuxbrew/workspace/fastq/*_{1,2}.fastq.gz"
 params.ReferenceGenome = "/home/linuxbrew/workspace/sequence.fasta"
-params.cpu = 12 // Change this to maximum number of CPUs to use
+params.cpu = Runtime.runtime.availableProcessors() // Change this to maximum number of CPUs to use
 process TRIMMOMATIC {
     errorStrategy "finish"
-    cpus params.cpu - 1
-    tag "TRIMMOMATIC on $sample"
+    cpus 3
+    memory '1 GB'
+    tag "TRIMMOMATIC for $sample"
 
     input:
     tuple val(sample), path(reads)
@@ -22,97 +23,48 @@ process TRIMMOMATIC {
     summary_files = sample + "_summary.txt"
 
     """
-    trimmomatic PE -threads $task.cpus -summary ${summary_files} ${reads[0]} ${reads[1]} ${fq_1_paired} ${fq_1_unpaired} ${fq_2_paired} ${fq_2_unpaired} SLIDINGWINDOW:4:25 MINLEN:90
+    trimmomatic PE -threads ${task.cpus} -summary ${summary_files} ${reads[0]} ${reads[1]} ${fq_1_paired} ${fq_1_unpaired} ${fq_2_paired} ${fq_2_unpaired} SLIDINGWINDOW:4:25 MINLEN:90
     """
 }
 
-process BWAMEM2 {
-    errorStrategy "finish"
-    cpus params.cpu - 1
-    tag "BWA-MEM2 in $sample"
+process FASTQ2BAM {
+    cpus 3
+    memory '3 GB'
+    tag "BWA-MEM2 for $sample"
 
     input:
     tuple val(sample), path(paired_reads)
 
     output:
-    tuple val(sample), path("*.sam")
+    tuple val(sample), path("*.bam"), emit: bam
 
     script:
     """
-    bwa-mem2 index ${params.ReferenceGenome}
-    bwa-mem2 mem -t ${task.cpus} ${params.ReferenceGenome} ${paired_reads[0]} ${paired_reads[1]} > ${sample}_alignment.sam
+    bwa-mem2 mem -t ${task.cpus} ${params.ReferenceGenome} ${paired_reads[0]} ${paired_reads[1]} | \
+    samtools fixmate -u -m - - | samtools sort -u -@ ${task.cpus} - | \
+    samtools markdup -@ ${task.cpus} --reference ${params.ReferenceGenome} - - | \
+    samtools view -@ ${task.cpus} -o ${sample}.bam -O bam,level=1
+    samtools index ${sample}.bam
     """
 }
 
-process SAMTOBAM {
-    errorStrategy "finish"
-    cpus params.cpu / 4
-    tag "SAM2BAM in $sample"
-
-    input:
-    tuple val(sample), path(sam_file)
-
-    output:
-    tuple val(sample), path("*.sorted.bam"), emit: bam
-
-    script:
-    """
-    samtools view -bS ${sam_file} -o ${sample}_alignment.bam -@ ${task.cpus}
-    samtools sort ${sample}_alignment.bam -o ${sample}_alignment.sorted.bam -@ ${task.cpus}
-    samtools index -b -o ${sample}_index.bai
-    """
-}
-
-process FREEBAYES {
+process CALL_SNP_WITH_QUAL {
     errorStrategy "finish"
     cpus 1
-    tag "Freebayes in $sample"
+    tag "Call SNP $sample"
 
     input:
-    tuple val(sample), path(sorted_bam)
+    tuple val(sample), path(bam)
 
     output:
-    tuple val(sample), path("*.vcf")
-
-    script:
-    // task properties
-    """
-    freebayes -f ${params.ReferenceGenome} -p 1 ${sorted_bam} > ${sample}.vcf
-    """
-}
-
-process VCF_FILTER {
-    errorStrategy "finish"
-    cpus 1
-    tag "Qualimap in $sample"
-
-    input:
-    tuple val(sample), path(vcf_files)
-
-    output:
-    tuple val(sample), path("*recode.vcf")
-
-    script:
-    """
-    vcftools --vcf ${vcf_files} --out ${sample} --minDP 20 --minQ 50 --recode --remove-filtered-all --recode-INFO-all
-    """
-}
-
-process VCF_GET_SNP_AND_RENAME {
-    errorStrategy "finish"
-    cpus 1
-    tag "Rename $sample"
-
-    input:
-    tuple val(sample), path(vcf_file)
-
-    output:
-    path("*.vcf.gz*")
+    path("*.vcf.gz")
 
     script:
     """
     echo ${sample} > ${sample}
-    bcftools view -v snps ${vcf_file} | bcftools reheader -s ${sample} - > ${sample}.vcf
+    freebayes -f ${params.ReferenceGenome} -p 1 ${bam} | \
+    vcftools --vcf - --stdout --minDP 20 --minQ 50 --recode --remove-filtered-all --recode-INFO-all | \
+    bcftools view -v snps - | bcftools reheader -s ${sample} - > ${sample}.vcf
     bgzip ${sample}.vcf
     tabix -p vcf ${sample}.vcf.gz
     """
@@ -120,7 +72,7 @@ process VCF_GET_SNP_AND_RENAME {
 
 process VCF_COMBINE {
     cpus params.cpu
-    tag "Combine"
+    tag "Combine VCF"
     publishDir "/home/linuxbrew/workspace/final", mode:"copy"
 
     input:
@@ -131,7 +83,7 @@ process VCF_COMBINE {
 
     script:
     """
-    ulimit -n 10000
+    ulimit -n 100000
     vcf_list=\$(echo "${vcf_gz_files}" | sed 's/\\[\\|,\\|\\]//g')
     bcftools merge -0 -m all \$(du -sh \$vcf_list | grep -v tbi | sort -h | awk '{if (\$1 != "4.0K") print \$2}') \
     --threads ${task.cpus} | bcftools norm -d all -m -any --threads ${task.cpus} - | sed 's/0\\/0:/0:/g'  \
@@ -184,16 +136,13 @@ process TRIMMOMATIC_LOGS {
 }
 
 workflow {
+    println("CPU available: ${params.cpu}")
     Channel.fromFilePairs(params.RawReads, checkIfExists: true, type: 'file').set { RawReads_channel }
     trim_channel = TRIMMOMATIC(RawReads_channel)
-    bwamem2_channel = BWAMEM2(TRIMMOMATIC.out.paired)
+    fastq2bam_channel = FASTQ2BAM(TRIMMOMATIC.out.paired)
     TRIMMOMATIC_LOGS(TRIMMOMATIC.out.summary.collect())
-    samtobam_channel = SAMTOBAM(bwamem2_channel)
-    freebayes_channel = FREEBAYES(samtobam_channel)
-    filter_channel = VCF_FILTER(freebayes_channel)
-    rename_channel = VCF_GET_SNP_AND_RENAME(filter_channel)
-    vcf_gz_files = rename_channel.collect()
-    combine_channel = VCF_COMBINE(vcf_gz_files)
+    snp_channel = CALL_SNP_WITH_QUAL(fastq2bam_channel)
+    combine_channel = VCF_COMBINE(snp_channel.collect())
     plink_channel = PLINK_QC(combine_channel)
 }
 
